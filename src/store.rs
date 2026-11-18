@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bytemuck::cast_slice;
@@ -14,7 +14,6 @@ use crate::quant::{self, QUANT_VERSION};
 use crate::scan;
 
 pub const F32_FILE: &str = "vectors.f32";
-/// 片压实时的原片备份：`vectors.f32.s<N>.old`
 fn slab_backup(dir: &Path, slab: u32) -> std::path::PathBuf {
     dir.join(format!("vectors.f32.s{slab}.old"))
 }
@@ -22,8 +21,6 @@ const SQ8_FILE: &str = "vectors.i8";
 const SQ8_TMP: &str = "vectors.i8.tmp";
 const JOURNAL_FILE: &str = "journal.bin";
 const LOCK_FILE: &str = "lock";
-const ALIVE_UNKNOWN: u32 = u32::MAX;
-/// 片级锁的槽数上限（超出部分共用最后一把锁，只是锁变粗）。
 const MAX_SLABS: usize = 64;
 const SQ8_MIN_ALIVE: u32 = 100_000;
 
@@ -37,7 +34,6 @@ pub struct Config {
     pub dim: u32,
     pub model_hash: String,
     pub initial_capacity: u32,
-    /// 片大小（行）。决定槽位 → 行的映射，写入 meta；缺省按 initial_capacity/16 取。
     pub slab_rows: Option<u32>,
 }
 
@@ -74,7 +70,6 @@ impl OpenOptions {
     }
 }
 
-/// 长任务（convert / compact）的进度与取消。
 #[derive(Clone, Copy, Debug)]
 pub struct JobProgress {
     pub done: u32,
@@ -124,22 +119,17 @@ pub struct Stats {
 pub struct Store {
     dir: PathBuf,
     _lock: File,
-    /// 元数据 / 提交（临界区只做短操作）。
     inner: RwLock<Inner>,
-    /// 片级读写锁：扫第 i 片时只挡第 i 片的写，compact/convert 才拿全部。
     slabs: Box<[RwLock<()>]>,
     slab_rows: u32,
 }
 
-/// 唯一的派生表示：`[i8; dim][f32 inv_scale]` 每行。
 struct Quant {
     stride: usize,
     file: File,
     map: Arc<Mmap>,
 }
 
-/// 写入一律走 pwrite，映射只读：mmap 写会让 FlushFileBuffers 重刷整个视图，
-/// 代价随文件增长（800 MB 文件上单次 append 从 16 ms 涨到 34 ms）。
 fn write_at(file: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
     let mut done = 0usize;
     while done < buf.len() {
@@ -165,7 +155,6 @@ struct Inner {
     map: Option<Arc<Mmap>>,
     quant: Option<Quant>,
     journal: Journal,
-    alive: AtomicU32,
 }
 
 impl Inner {
@@ -173,7 +162,6 @@ impl Inner {
         self.meta.dim as usize
     }
 
-    /// 下一个可追加槽位。
     fn n(&self) -> u32 {
         self.meta.watermark()
     }
@@ -186,8 +174,6 @@ impl Inner {
         self.meta.slabs.len() as u32
     }
 
-    /// 真正被分配的行数（各片行数之和）。片级压实会在片尾留洞，
-    /// 所以它 ≤ 水位 `n()`；`n()` 只表示"下一个可追加槽位"。
     fn rows_allocated(&self) -> u32 {
         self.meta.slabs.iter().sum()
     }
@@ -208,7 +194,6 @@ impl Inner {
         self.map.as_ref().expect("store is mapped")
     }
 
-    /// 整份文件的行，按 f32 视图（含片尾垃圾区）。
     fn rows_all(&self) -> &[f32] {
         let len = self.capacity() as usize * self.stride;
         cast_slice(&self.map()[..len])
@@ -224,7 +209,6 @@ impl Inner {
         self.row_at(slot)[0] == 0.0
     }
 
-    /// 数据落盘。映射是只读的，所以只有 pwrite 产生脏页，刷的是增量。
     fn commit(&self) -> Result<()> {
         self.file.sync_all()?;
         if let Some(q) = &self.quant {
@@ -233,12 +217,11 @@ impl Inner {
         Ok(())
     }
 
-    /// 首次调用扫一遍首位（@1M 约 10~30 ms），之后靠 append/delete/compact 增量维护。
-    fn alive_now(&self) -> u32 {
-        let a = self.alive.load(Ordering::Relaxed);
-        if a != ALIVE_UNKNOWN {
-            return a;
-        }
+    fn alive(&self) -> u32 {
+        self.rows_allocated().saturating_sub(self.meta.deleted)
+    }
+
+    fn recount_alive(&self) -> u32 {
         let dim = self.dim();
         let mut dead = 0u32;
         for slab in 0..self.slab_count() {
@@ -248,12 +231,9 @@ impl Inner {
                 .filter(|r| r[0] == 0.0)
                 .count() as u32;
         }
-        let alive = self.rows_allocated() - dead;
-        self.alive.store(alive, Ordering::Relaxed);
-        alive
+        dead
     }
 
-    /// §5.1 AUTO：SQ8 已物化且数据够多才走 SQ8，否则 f32。
     fn suggest(&self, alive: u32) -> Repr {
         if self.quant.is_some() && alive >= SQ8_MIN_ALIVE {
             Repr::Sq8
@@ -312,7 +292,6 @@ fn default_threads() -> usize {
         .unwrap_or(1)
 }
 
-/// 按整片扩容：加到能容纳 `need` 行为止。
 fn grow(inner: &mut Inner, need: u32) -> Result<()> {
     let sr = inner.meta.slab_rows;
     while inner.capacity() < need {
@@ -329,7 +308,6 @@ fn grow(inner: &mut Inner, need: u32) -> Result<()> {
     Ok(())
 }
 
-/// 校验 + L2 归一化。全部校验通过才返回，调用方不会写出半个批次。
 fn normalize(vecs: &[f32], dim: usize) -> Result<Vec<f32>> {
     if dim == 0 || vecs.len() % dim != 0 {
         return Err(Error::DimMismatch);
@@ -351,7 +329,6 @@ fn normalize(vecs: &[f32], dim: usize) -> Result<Vec<f32>> {
         for (d, &v) in dst.iter_mut().zip(row) {
             *d = v * inv;
         }
-        // 墓碑判定是 v[0] == 0，活跃行必须首位非零；扰动在 f32 精度内不可见。
         if dst[0] == 0.0 {
             dst[0] = 1e-30;
         }
@@ -359,8 +336,6 @@ fn normalize(vecs: &[f32], dim: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// 片级压实的回滚：`compacting = Some(slab)` 且备份在 → 把原片写回并清标记；
-/// 否则残留的备份都是"已提交但没删掉"，直接删。
 fn recover_compact(dir: &Path, meta: &mut Meta) -> Result<()> {
     let stride = meta.dim as u64 * 4;
     if let Some(slab) = meta.compacting {
@@ -376,14 +351,12 @@ fn recover_compact(dir: &Path, meta: &mut Meta) -> Result<()> {
             write_at(&f, &bytes, off)?;
             f.sync_all()?;
         }
-        // 派生文件可能写到一半，无法逐片修复 → 整体作废，退回纯 f32
         if meta.quant_version.is_some() {
             meta.quant_version = None;
         }
         meta.compacting = None;
         meta.write(dir)?;
     }
-    // 清掉所有残留备份（含已提交的）
     for e in fs::read_dir(dir)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
@@ -413,10 +386,9 @@ fn open_quant(dir: &Path, capacity: u32, dim: usize) -> Result<Option<Quant>> {
     Ok(Some(Quant { stride, file, map }))
 }
 
-/// 每次编码/写入的行数，既是内存上界也是进度与取消的响应粒度。
+
 const JOB_CHUNK: u32 = 4096;
 
-/// 从 f32 权威数据整份重建派生文件，`meta.quant_version` 是提交点。
 fn build_quant(inner: &mut Inner, dir: &Path, opts: &JobOptions) -> Result<()> {
     let dim = inner.dim();
     let qstride = quant::stride(dim);
@@ -459,7 +431,6 @@ fn build_quant(inner: &mut Inner, dir: &Path, opts: &JobOptions) -> Result<()> {
         f.sync_all()?;
     }
 
-    // Windows：目标有活动映射时 rename 覆盖会失败，先丢映射。
     inner.quant = None;
     let path = dir.join(SQ8_FILE);
     fs::rename(&tmp, &path)?;
@@ -486,11 +457,9 @@ impl Store {
         }
         let lock = open_lock(&dir)?;
         let stride = cfg.dim as usize * 4;
-        // 片大小在 create 时定死并写进 meta（它决定槽位 → 行的映射）。
         let slab_rows = cfg
             .slab_rows
             .unwrap_or_else(|| (cfg.initial_capacity / 16).clamp(4096, 1 << 20));
-        // 按宿主的 initial_capacity 预分配整片（不足一片也算一片）
         let n_slabs = cfg.initial_capacity.max(1).div_ceil(slab_rows).max(1);
         let meta = Meta {
             format: FORMAT.to_string(),
@@ -499,10 +468,10 @@ impl Store {
             slabs: vec![0; n_slabs as usize],
             model_hash: cfg.model_hash,
             quant_version: None,
+            deleted: 0,
             compacting: None,
         };
         let capacity = meta.capacity();
-        // 数据文件先就位，meta 最后写（提交点）：中途崩溃只会留下"没创建"的目录。
         let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -526,7 +495,6 @@ impl Store {
                 map: Some(map),
                 quant: None,
                 journal,
-                alive: AtomicU32::new(0),
             }),
         })
     }
@@ -558,7 +526,6 @@ impl Store {
         if capacity < meta.capacity() {
             file.set_len(meta.capacity() as u64 * stride as u64)?;
         } else if capacity > meta.capacity() {
-            // 文件比 meta 记录的长：多出来的是上次扩容没提交的尾巴，截掉
             file.set_len(meta.capacity() as u64 * stride as u64)?;
         }
         let map = Arc::new(unsafe { Mmap::map(&file)? });
@@ -570,10 +537,8 @@ impl Store {
             map: Some(map),
             quant: None,
             journal,
-            alive: AtomicU32::new(ALIVE_UNKNOWN),
         };
 
-        // 派生表示的提交点是 meta.quant_version：版本不符或没有标记都清掉。
         let has_quant = dir.join(SQ8_FILE).exists();
         match has_quant {
             true if inner.meta.quant_version != Some(QUANT_VERSION) => {
@@ -601,8 +566,15 @@ impl Store {
                 apply_frame(&inner, f)?;
             }
             inner.commit()?;
+            inner.journal.truncate()?;
+            let dead = inner.recount_alive();
+            if dead != inner.meta.deleted {
+                inner.meta.deleted = dead;
+                inner.meta.write(&dir)?;
+            }
+        } else {
+            inner.journal.truncate()?;
         }
-        inner.journal.truncate()?;
         let slab_rows = inner.meta.slab_rows;
 
         Ok(Store {
@@ -616,7 +588,7 @@ impl Store {
 
     pub fn append(&self, vecs: &[f32]) -> Result<u32> {
         let dim = self.dim() as usize;
-        let normalized = normalize(vecs, dim)?; // 编码在锁外
+        let normalized = normalize(vecs, dim)?;
         let m = (normalized.len() / dim) as u32;
 
         loop {
@@ -631,15 +603,14 @@ impl Store {
 
             let mut inner = self.inner.write().unwrap();
             if inner.n() != start {
-                continue; // 期间被别人追加了，重来
+                continue;
             }
             let need = start.checked_add(m).ok_or(Error::InvalidConfig)?;
             if need > inner.capacity() {
                 grow(&mut inner, need)?;
             }
             inner.write_f32_rows(start, &normalized)?;
-            inner.commit()?; // 数据先落盘
-            // 提交点：把新行记进所属片（一批可能跨多片，前面几片补满）
+            inner.commit()?;
             let sr = inner.meta.slab_rows;
             let last = (need - 1) / sr;
             for i in 0..=last {
@@ -648,10 +619,6 @@ impl Store {
             }
             inner.meta.write(&self.dir)?;
 
-            let a = inner.alive.load(Ordering::Relaxed);
-            if a != ALIVE_UNKNOWN {
-                inner.alive.store(a + m, Ordering::Relaxed);
-            }
             return Ok(start);
         }
     }
@@ -680,7 +647,7 @@ impl Store {
             })
             .collect();
         inner.journal.write_batch(&frames)?;
-        inner.journal.commit()?; // ← 提交点
+        inner.journal.commit()?;
         for f in &frames {
             apply_frame(&inner, f)?;
         }
@@ -704,33 +671,25 @@ impl Store {
             }
         }
         if dead.is_empty() {
-            return Ok(()); // 幂等
+            return Ok(());
         }
         let frames: Vec<Frame> = dead.iter().map(|&slot| Frame::Delete { slot }).collect();
         inner.journal.write_batch(&frames)?;
-        inner.journal.commit()?; // ← 提交点
+        inner.journal.commit()?;
         for f in &frames {
             apply_frame(&inner, f)?;
         }
         inner.commit()?;
+        inner.meta.deleted += dead.len() as u32;
+        inner.meta.write(&self.dir)?;
         inner.journal.truncate()?;
-
-        let a = inner.alive.load(Ordering::Relaxed);
-        if a != ALIVE_UNKNOWN {
-            inner.alive.store(a - dead.len() as u32, Ordering::Relaxed);
-        }
         Ok(())
     }
 
-    /// 压实一片：只重写这一片的区间，其它片一个字节都不动。
-    /// 提交点是 meta.slabs[i]；中途崩溃由 `meta.compacting` + `vectors.f32.sN.old` 回滚。
-    /// 返回 (old_slots, new_slots) 平行数组（只覆盖本片）；无事可做时返回两个空数组。
     pub fn compact_slab(&self, slab: u32) -> Result<(Vec<u32>, Vec<u32>)> {
         self.compact_slab_with(slab, &JobOptions::default())
     }
 
-    /// 带进度与取消的片级压实。取消（或中途失败）会用备份把这一片写回，
-    /// 并作废派生表示——库退化成纯 f32，但不会留下半压实的数据。
     pub fn compact_slab_with(
         &self,
         slab: u32,
@@ -749,7 +708,6 @@ impl Store {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // 1) 备份原片（回滚点）
         let bak = slab_backup(&self.dir, slab);
         {
             let mut f = fs::OpenOptions::new()
@@ -763,11 +721,8 @@ impl Store {
             f.write_all(cast_slice::<f32, u8>(&base[d0..d1]))?;
             f.sync_all()?;
         }
-        // 2) 标记"正在压实这一片"
         inner.meta.compacting = Some(slab);
         inner.meta.write(&self.dir)?;
-        // 3) 分块就地写回。每块都从"原数据"重新读（边写边读会读到刚被清零的片尾），
-        //    块之间检查取消。
         let mut wrote = 0u32;
         opts.report(0, alive.len() as u32);
         while wrote < alive.len() as u32 {
@@ -776,7 +731,6 @@ impl Store {
                 return Err(Error::Cancelled);
             }
             let n = (alive.len() as u32 - wrote).min(JOB_CHUNK);
-            // 两份缓冲都要在写之前从"原数据"读出来：写下去之后同一段映射看到的就是新数据了。
             let (fbuf, qbuf) = {
                 let rows = inner.rows_all();
                 let mut fbuf = vec![0u8; n as usize * stride];
@@ -803,7 +757,6 @@ impl Store {
             wrote += n;
             opts.report(wrote, alive.len() as u32);
         }
-        // 片尾清零（f32 与派生）
         let tail = (hi - lo - alive.len() as u32) as usize;
         if tail > 0 {
             write_at(
@@ -820,21 +773,16 @@ impl Store {
             }
         }
         inner.commit()?;
-        // 4) 提交：改片行数并清标记
+        let dropped = (hi - lo) - alive.len() as u32;
         inner.meta.slabs[slab as usize] = alive.len() as u32;
+        inner.meta.deleted = inner.meta.deleted.saturating_sub(dropped);
         inner.meta.compacting = None;
         inner.meta.write(&self.dir)?;
-        // 5) 删除备份
         let _ = fs::remove_file(&bak);
 
-        let a = inner.alive.load(Ordering::Relaxed);
-        if a != ALIVE_UNKNOWN {
-            inner.alive.store(a, Ordering::Relaxed);
-        }
         Ok((alive, (lo..lo + inner.meta.slabs[slab as usize]).collect()))
     }
 
-    /// 逐片压实；每片独立提交（大库建议宿主自己按片调用，好在每片之间重写主键）。
     pub fn compact(&self) -> Result<(Vec<u32>, Vec<u32>)> {
         let slabs = self.inner.read().unwrap().slab_count();
         let (mut old, mut new) = (Vec::new(), Vec::new());
@@ -846,30 +794,25 @@ impl Store {
         Ok((old, new))
     }
 
-    /// 片数与每片行数（宿主按片维护主键时要读）。
     pub fn slab_info(&self) -> (u32, u32) {
         let g = self.inner.read().unwrap();
         (g.slab_count(), g.meta.slab_rows)
     }
 
-    /// 槽位 → 片号；超出 MAX_SLABS 片的部分共用最后一把锁（只是锁变粗，不影响正确性）。
     fn slab_of(&self, slot: u32) -> u32 {
         (slot / self.slab_rows).min(MAX_SLABS as u32 - 1)
     }
 
-    /// 片级读锁：扫第 i 片时只挡第 i 片的写。逐片加锁 → 扫完即放。
     fn read_slab(&self, slab: u32) -> RwLockReadGuard<'_, ()> {
         self.slabs[slab as usize].read().unwrap()
     }
 
-    /// 片级写锁：按片号升序取，和搜索的加锁顺序一致（扫描不取 inner，故无环）。
     fn write_slabs(&self, first: u32, last: u32) -> Vec<RwLockWriteGuard<'_, ()>> {
         (first..=last)
             .map(|i| self.slabs[i as usize].write().unwrap())
             .collect()
     }
 
-    /// 一批槽位覆盖的片区间（用于取片级写锁）。
     fn span_of(&self, slots: &[u32]) -> (u32, u32) {
         if slots.is_empty() {
             return (0, 0);
@@ -888,7 +831,6 @@ impl Store {
     }
 
     pub fn search(&self, q: &[f32], k: usize, opts: SearchOptions) -> Result<SearchResult> {
-        // 短临界区：只取快照（Arc 克隆），之后全程不持 inner 锁。
         let (dim, n, stride, f32_map, quant) = {
             let g = self.inner.read().unwrap();
             (
@@ -906,7 +848,7 @@ impl Store {
             return Err(Error::Empty);
         }
         let qn = normalize(q, dim)?;
-        let alive = self.inner.read().unwrap().alive_now();
+        let alive = self.inner.read().unwrap().alive();
 
         let actual = if quant.is_some() { Repr::Sq8 } else { Repr::F32 };
         let repr = match opts.repr {
@@ -915,8 +857,6 @@ impl Store {
             Some(r) => r,
             None => self.inner.read().unwrap().suggest(alive),
         };
-        // 默认重排深度取 2×k：1M 实测 depth=k 只有 96.5~99.2%，depth=2k 是 100%。
-        // 显式给出的 rerank 一律照办，不偷偷放大。
         let depth = opts
             .rerank
             .or(match repr {
@@ -934,7 +874,6 @@ impl Store {
         let threads = opts.threads.unwrap_or_else(default_threads);
         let last_slab = self.slab_of(n - 1);
 
-        // 查询向量量化（每片复用同一份）
         let (qi8, inv_q) = match repr {
             Repr::Sq8 => {
                 let (a, b) = quant::encode_query(&qn)?;
@@ -943,7 +882,6 @@ impl Store {
             Repr::F32 => (None, 0.0),
         };
 
-        // 逐片扫描：每片独立加读锁，扫完立刻释放 → 别的片可以同时写。
         let mut hits: Vec<scan::Hit> = Vec::new();
         let mut dead = 0u32;
         for slab in 0..=last_slab {
@@ -979,8 +917,6 @@ impl Store {
             hits.extend(h);
             dead += d;
         }
-        // 注意：不在这里回写 alive。搜索不持 inner 锁，用快照算出来的 alive 可能已被
-        // 并发 delete 改过；alive 只由 append/delete/compact 在 inner 写锁下维护。
         let _ = dead;
 
         hits.sort_unstable_by(|a, b| {
@@ -990,12 +926,8 @@ impl Store {
         });
         hits.truncate(kk);
 
-        // 重排：slots 升序 gather f32，精确点积，再按精确分数排序。
-        // 只要走了低精度扫描且请求了重排（depth > 0）就重排，哪怕候选正好只有 k 条——
-        // 否则分数会退化成量化值，与"重排后返回精确余弦"的契约不符。
         let do_rerank = repr != Repr::F32 && depth.map_or(false, |d| d > 0);
         let mut ranked: Vec<(f32, u32)> = if do_rerank && !hits.is_empty() {
-            // gather 阶段要读 f32，短暂拿全部片读锁（毫秒级）。
             let _guards = self.all_read_slabs(last_slab);
             let base: &[f32] = cast_slice(&f32_map[..n as usize * stride]);
             let mut slots: Vec<u32> = hits.iter().map(|h| h.slot).collect();
@@ -1027,7 +959,6 @@ impl Store {
         })
     }
 
-    /// 最高精度可用表示：f32 恒在。
     pub fn vectors(&self, slots: &[u32]) -> Result<Vec<f32>> {
         let inner = self.inner.read().unwrap();
         let dim = inner.dim();
@@ -1041,16 +972,25 @@ impl Store {
         Ok(out)
     }
 
+    pub fn warm(&self) -> Result<u32> {
+        let mut inner = self.inner.write().unwrap();
+        let dead = inner.recount_alive();
+        if dead != inner.meta.deleted {
+            inner.meta.deleted = dead;
+            inner.meta.write(&self.dir)?;
+        }
+        Ok(inner.alive())
+    }
+
     pub fn suggest_mode(&self) -> Repr {
         let inner = self.inner.read().unwrap();
-        inner.suggest(inner.alive_now())
+        inner.suggest(inner.alive())
     }
 
     pub fn convert(&self, target: Repr) -> Result<()> {
         self.convert_with(target, &JobOptions::default())
     }
 
-    /// 带进度与取消的 `convert`。取消时派生文件不落地，库保持原样。
     pub fn convert_with(&self, target: Repr, opts: &JobOptions) -> Result<()> {
         let _slabs = self.write_slabs(0, MAX_SLABS as u32 - 1);
         let mut inner = self.inner.write().unwrap();
@@ -1073,7 +1013,7 @@ impl Store {
         Stats {
             dim: inner.meta.dim,
             n: inner.n(),
-            alive: inner.alive_now(),
+            alive: inner.alive(),
             capacity: inner.capacity(),
             repr: inner.repr(),
         }
@@ -1092,7 +1032,6 @@ impl Store {
     }
 }
 
-/// 取消/失败时把某一片恢复原状：写回备份、清 `compacting`、作废派生表示。
 fn abort_slab(inner: &mut Inner, dir: &Path, slab: u32, bak: &Path) -> Result<()> {
     let stride = inner.stride;
     let (lo, _) = inner.slab_range(slab);
@@ -1102,7 +1041,6 @@ fn abort_slab(inner: &mut Inner, dir: &Path, slab: u32, bak: &Path) -> Result<()
         inner.file.sync_all()?;
         let _ = fs::remove_file(bak);
     }
-    // 派生文件可能只写了一半，无法逐片修复 → 整体作废
     if let Some(q) = inner.quant.take() {
         let path = dir.join(SQ8_FILE);
         drop(q);

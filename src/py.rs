@@ -43,7 +43,6 @@ fn repr_of(r: Repr) -> Mode {
     }
 }
 
-/// 取消令牌：传给 `convert(..., cancel=token)`，另一个线程调 `token.cancel()` 即可中断。
 #[pyclass]
 struct CancelToken {
     flag: Arc<AtomicBool>,
@@ -100,7 +99,6 @@ impl PyStore {
             .map_err(err)
     }
 
-    /// float32 (m, dim) → 新增的槽位号。
     fn append<'py>(
         &self,
         py: Python<'py>,
@@ -124,7 +122,6 @@ impl PyStore {
         self.inner.delete(&s).map_err(err)
     }
 
-    /// (old_slots, new_slots)
     fn compact<'py>(
         &self,
         py: Python<'py>,
@@ -166,7 +163,6 @@ impl PyStore {
         ))
     }
 
-    /// float32 (m, dim)
     fn vectors<'py>(
         &self,
         py: Python<'py>,
@@ -182,8 +178,6 @@ impl PyStore {
             .into_pyarray(py))
     }
 
-    /// convert(target, progress=None, cancel=None)
-    /// progress: 可调用对象，收到 (done, total) 两个整数（行）。
     #[pyo3(signature = (target, progress = None, cancel = None))]
     fn convert(
         &self,
@@ -228,16 +222,19 @@ impl PyStore {
         self.inner.n()
     }
 
+    fn warm(&self, py: Python<'_>) -> PyResult<u32> {
+        let inner = &self.inner;
+        py.detach(|| inner.warm()).map_err(err)
+    }
+
     fn suggest_mode(&self) -> Mode {
         repr_of(self.inner.suggest_mode())
     }
 
-    /// (片数, 每片行数)
     fn slab_info(&self) -> (u32, u32) {
         self.inner.slab_info()
     }
 
-    /// (dim, n, alive, capacity, repr)
     fn stats(&self) -> (u32, u32, u32, u32, Mode) {
         let s = self.inner.stats();
         (s.dim, s.n, s.alive, s.capacity, repr_of(s.repr))

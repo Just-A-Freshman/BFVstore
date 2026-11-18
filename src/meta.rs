@@ -10,7 +10,7 @@ pub const FORMAT: &str = "vstore-l2-3";
 pub const META_FILE: &str = "meta.json";
 pub const MAX_DIM: u32 = 4096;
 
-/// 只存推不出来的东西。`slabs` 是每片的行数（片 = `slab_rows` 行的固定区间）。
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Meta {
     pub format: String,
@@ -18,10 +18,10 @@ pub struct Meta {
     pub slab_rows: u32,
     pub slabs: Vec<u32>,
     pub model_hash: String,
-    /// 仅当有派生表示时出现；不等于库内 QUANT_VERSION 时 open 会清掉派生文件。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quant_version: Option<u32>,
-    /// 正在压实片；非空时 open 会从 `vectors.f32.sN.old` 回滚该片。
+    #[serde(default)]
+    pub deleted: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<u32>,
 }
@@ -46,7 +46,6 @@ impl Meta {
         Ok(m)
     }
 
-    /// tmp → sync_all → rename，唯一提交点。
     pub fn write(&self, dir: &Path) -> Result<()> {
         let tmp = dir.join("meta.json.tmp");
         {
@@ -58,13 +57,10 @@ impl Meta {
         Ok(())
     }
 
-    /// 预分配的总行数。
     pub fn capacity(&self) -> u32 {
         self.slabs.len() as u32 * self.slab_rows
     }
 
-    /// 下一个可追加的槽位：最后一片非空片的末尾（全空则为 0）。
-    /// 预分配的空片不算在内，否则新建的库水位会凭空跳到几百。
     pub fn watermark(&self) -> u32 {
         for (i, n) in self.slabs.iter().enumerate().rev() {
             if *n > 0 {
