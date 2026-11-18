@@ -1,0 +1,10 @@
+target/
+.pysmoke/
+python/
+examples/
+docs/
+*.pyd
+.patch.py
+Agent.md
+tests/
+
